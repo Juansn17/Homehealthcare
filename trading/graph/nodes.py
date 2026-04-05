@@ -27,6 +27,8 @@ def market_clock_check(state: TradingState) -> dict:
         "fundamental_signals": [],
         "consolidated_decisions": [],
         "risk_assessments": [],
+        "approved_orders": [],
+        "balance_rejections": [],
         "orders_to_place": [],
         "order_results": [],
         "messages": [],
@@ -194,3 +196,223 @@ def sleep_node(state: TradingState) -> dict:
     """Market is closed — nothing to do."""
     logger.info("Market closed (phase=%s), skipping cycle", state.get("phase"))
     return {"cycle_summary": f"Market closed: {state.get('phase')}"}
+
+
+# ── Dual-strategy nodes ───────────────────────────────────────────────────────
+
+def st_agent_node(state: TradingState) -> dict:
+    """Short-term momentum agent (Gemma 4, intraday 15m).
+
+    Runs in parallel with lt_agent_node. Appends to consolidated_decisions.
+    Only runs when market is open (intraday execution needed).
+    """
+    if state.get("phase") not in ("market_open",):
+        logger.info("ST agent skipped (phase=%s)", state.get("phase"))
+        return {"consolidated_decisions": []}
+
+    from trading.agents.st_agent import run as run_st
+    signals = run_st(state["market_snapshots"])
+
+    # Convert ST signals directly to decisions (ST agent is opinionated enough)
+    decisions = [
+        {
+            "ticker": s["ticker"],
+            "action": s["signal"],
+            "confidence": int(s["strength"] * 100),
+            "strategy": s["strategy"],
+            "ta_signal": s["signal"],
+            "fa_signal": "",
+            "reasoning": "; ".join(s.get("reasons", [])[:2]),
+            "concerns": "" if s.get("trend_aligned") else "trend misalignment",
+            "timestamp": s["timestamp"],
+        }
+        for s in signals
+        if s.get("signal") != "HOLD" and s.get("trend_aligned", True)
+    ]
+    logger.info("ST agent: %d actionable decisions", len(decisions))
+    return {"consolidated_decisions": decisions}
+
+
+def lt_agent_node(state: TradingState) -> dict:
+    """Long-term fundamental agent (Claude Sonnet, daily+weekly).
+
+    Runs in parallel with st_agent_node. Appends to consolidated_decisions.
+    Runs in both market_open and pre_market phases (no intraday timing needed).
+    """
+    from trading.agents.lt_agent import run as run_lt
+    # LT uses full universe — fundamental screening is independent of intraday
+    signals = run_lt(state["market_snapshots"])
+
+    decisions = [
+        {
+            "ticker": s["ticker"],
+            "action": s["signal"],
+            "confidence": int(s["strength"] * 100),
+            "strategy": s["strategy"],
+            "ta_signal": "",
+            "fa_signal": s["signal"],
+            "reasoning": "; ".join(s.get("reasons", [])[:2]),
+            "concerns": "earnings risk" if s.get("earnings_risk") else s.get("macro_stance", ""),
+            "timestamp": s["timestamp"],
+        }
+        for s in signals
+        if s.get("signal") != "HOLD" and not s.get("earnings_risk", False)
+    ]
+    logger.info("LT agent: %d actionable decisions", len(decisions))
+    return {"consolidated_decisions": decisions}
+
+
+def st_risk_check_node(state: TradingState) -> dict:
+    """Risk check for short-term decisions with ST-specific parameters."""
+    from trading.config.strategy_config import SHORT_TERM
+    return _strategy_risk_check(state, SHORT_TERM)
+
+
+def lt_risk_check_node(state: TradingState) -> dict:
+    """Risk check for long-term decisions with LT-specific parameters."""
+    from trading.config.strategy_config import LONG_TERM
+    return _strategy_risk_check(state, LONG_TERM)
+
+
+def _strategy_risk_check(state: TradingState, strategy) -> dict:
+    """Shared risk check logic parameterized by StrategyConfig."""
+    from trading.config.strategy_config import StrategyConfig
+    assessments = []
+    positions = state.get("current_positions", {})
+    portfolio_value = state["portfolio_value"]
+    available_cash = state["available_cash"]
+    peak = state.get("peak_portfolio_value") or portfolio_value
+    daily_loss = state.get("daily_loss_usd", 0.0)
+
+    strategy_decisions = [
+        d for d in state.get("consolidated_decisions", [])
+        if d.get("strategy") == strategy.name and d.get("action", "HOLD") != "HOLD"
+    ]
+
+    for decision in strategy_decisions:
+        ticker = decision["ticker"]
+        snapshot = next(
+            (s for s in state["market_snapshots"] if s["ticker"] == ticker), None
+        )
+        if not snapshot:
+            continue
+
+        entry_price = snapshot["price"]
+        atr = snapshot["indicators"].get("atr_14")
+        if not atr:
+            logger.warning("No ATR for %s (%s), skipping", ticker, strategy.name)
+            continue
+
+        # Use strategy-specific ATR multiplier and R:R ratio
+        stop_distance = atr * strategy.stop_atr_multiplier
+        stop_distance_pct = stop_distance / entry_price
+
+        if stop_distance_pct < 0.01 or stop_distance_pct > 0.10:
+            assessments.append({
+                "ticker": ticker, "approved": False,
+                "position_size_usd": 0.0, "qty": 0.0,
+                "stop_loss_price": 0.0, "take_profit_price": 0.0,
+                "rejection_reason": f"Stop distance {stop_distance_pct:.2%} out of range for {strategy.name}",
+                "strategy": strategy.name,
+            })
+            continue
+
+        # Strategy-specific position sizing
+        strategy_budget = available_cash * strategy.portfolio_allocation_pct
+        risk_based = (portfolio_value * strategy.position_risk_pct) / stop_distance_pct
+        max_size = portfolio_value * 0.05 * (strategy.portfolio_allocation_pct * 2)
+        if settings.IS_LIVE:
+            max_size *= settings.LIVE_POSITION_SCALE
+        position_size_usd = min(risk_based, max_size, strategy_budget * 0.3)
+
+        if position_size_usd < 10:
+            assessments.append({
+                "ticker": ticker, "approved": False,
+                "position_size_usd": 0.0, "qty": 0.0,
+                "stop_loss_price": 0.0, "take_profit_price": 0.0,
+                "rejection_reason": f"Position too small ${position_size_usd:.0f}",
+                "strategy": strategy.name,
+            })
+            continue
+
+        stop_loss_price = round(entry_price - stop_distance, 2)
+        take_profit_price = round(entry_price + stop_distance * strategy.reward_risk_ratio, 2)
+        qty = round(position_size_usd / entry_price, 4)
+
+        # Drawdown guard applies to all strategies
+        if peak > 0 and (peak - portfolio_value) / peak > settings.MAX_DRAWDOWN_PCT:
+            assessments.append({
+                "ticker": ticker, "approved": False,
+                "position_size_usd": 0.0, "qty": 0.0,
+                "stop_loss_price": 0.0, "take_profit_price": 0.0,
+                "rejection_reason": "Portfolio drawdown limit reached",
+                "strategy": strategy.name,
+            })
+            continue
+
+        # Skip if already holding
+        if ticker in positions:
+            assessments.append({
+                "ticker": ticker, "approved": False,
+                "position_size_usd": 0.0, "qty": 0.0,
+                "stop_loss_price": 0.0, "take_profit_price": 0.0,
+                "rejection_reason": f"Already holding {ticker}",
+                "strategy": strategy.name,
+            })
+            continue
+
+        logger.info(
+            "Risk APPROVED [%s] %s: size=$%.0f stop=%.2f tp=%.2f",
+            strategy.name, ticker, position_size_usd, stop_loss_price, take_profit_price,
+        )
+        assessments.append({
+            "ticker": ticker,
+            "approved": True,
+            "position_size_usd": round(position_size_usd, 2),
+            "qty": qty,
+            "stop_loss_price": stop_loss_price,
+            "take_profit_price": take_profit_price,
+            "rejection_reason": None,
+            "strategy": strategy.name,
+        })
+
+    return {"risk_assessments": assessments}
+
+
+def portfolio_balancer_node(state: TradingState) -> dict:
+    """Resolve conflicts between ST and LT, enforce combined risk limits.
+
+    Runs after both st_risk_check and lt_risk_check complete (fan-in).
+    """
+    from trading.graph.portfolio_balancer import balance
+
+    approved_orders, rejections = balance(
+        risk_assessments=state.get("risk_assessments", []),
+        portfolio_value=state["portfolio_value"],
+        available_cash=state["available_cash"],
+        current_positions=state.get("current_positions", {}),
+    )
+
+    if rejections:
+        for r in rejections:
+            logger.info("Balancer rejected: %s", r)
+
+    logger.info(
+        "Balancer: %d orders approved (%d ST, %d LT)",
+        len(approved_orders),
+        sum(1 for o in approved_orders if o.get("strategy") == "short_term"),
+        sum(1 for o in approved_orders if o.get("strategy") == "long_term"),
+    )
+    return {
+        "approved_orders": approved_orders,
+        "balance_rejections": rejections,
+    }
+
+
+def dual_execution_node(state: TradingState) -> dict:
+    """Submit approved orders from the portfolio balancer."""
+    from trading.execution.order_manager import submit_approved_orders
+    approved = state.get("approved_orders", [])
+    results = submit_approved_orders(approved, state["market_snapshots"])
+    logger.info("Dual execution: submitted %d orders", len(results))
+    return {"order_results": results}

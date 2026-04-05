@@ -21,7 +21,8 @@ class TechnicalSignal(TypedDict):
     signal: str          # "BUY" | "SELL" | "HOLD"
     strength: float      # 0.0–1.0
     reasons: list[str]
-    source: str          # "llm" | "rule_based"
+    source: str          # "llm" | "rule_based" | "st_agent" | "lt_agent"
+    strategy: str        # "short_term" | "long_term" | "" (single-strategy mode)
     timestamp: str
 
 
@@ -44,6 +45,7 @@ class RiskAssessment(TypedDict):
     stop_loss_price: float
     take_profit_price: float
     rejection_reason: str | None
+    strategy: str        # "short_term" | "long_term" | "" (single-strategy mode)
 
 
 class OrderResult(TypedDict):
@@ -74,8 +76,12 @@ class TradingState(TypedDict):
     fundamental_signals: Annotated[list[FundamentalSignal], operator.add]
 
     # ── Decision layer ────────────────────────────────────────────────────────
-    consolidated_decisions: list[dict]   # [{ticker, action, confidence, reasons}]
-    risk_assessments: list[RiskAssessment]
+    # Both strategies append to these lists concurrently (fan-in safe)
+    consolidated_decisions: Annotated[list[dict], operator.add]
+    risk_assessments: Annotated[list[RiskAssessment], operator.add]
+    # Final balanced orders after portfolio_balancer resolves conflicts
+    approved_orders: list[dict]
+    balance_rejections: list[str]
 
     # ── Execution ─────────────────────────────────────────────────────────────
     orders_to_place: list[dict]

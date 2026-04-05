@@ -25,3 +25,15 @@ def route_after_risk(state: TradingState) -> str:
     if state.get("phase") == "pre_market":
         return "halt_node"
     return "execution_node"
+
+
+def route_after_balancer(state: TradingState) -> str:
+    """Route to execution if portfolio balancer approved any orders, else halt."""
+    if state.get("error"):
+        return "halt_node"
+    approved = state.get("approved_orders", [])
+    if not approved:
+        return "halt_node"
+    if state.get("phase") == "pre_market":
+        return "halt_node"
+    return "dual_execution_node"

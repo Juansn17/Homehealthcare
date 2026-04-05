@@ -86,6 +86,11 @@ def main():
     parser = argparse.ArgumentParser(description="Algorithmic Trading Agent System")
     parser.add_argument("--once", action="store_true", help="Run a single cycle and exit")
     parser.add_argument("--dry-run", action="store_true", help="Run without submitting real orders")
+    parser.add_argument(
+        "--dual-strategy",
+        action="store_true",
+        help="Run parallel short-term (Gemma) + long-term (Claude) strategies",
+    )
     args = parser.parse_args()
 
     # Safety check: prevent accidental live trading
@@ -97,9 +102,14 @@ def main():
         logger.info("Paper trading mode (safe)")
 
     # Build compiled graph
-    from trading.graph.workflow import get_compiled_graph
-    graph = get_compiled_graph()
-    logger.info("Graph compiled successfully")
+    if args.dual_strategy:
+        from trading.graph.workflow import get_compiled_dual_graph
+        graph = get_compiled_dual_graph()
+        logger.info("Dual-strategy graph compiled (ST: Gemma/intraday + LT: Claude/fundamental)")
+    else:
+        from trading.graph.workflow import get_compiled_graph
+        graph = get_compiled_graph()
+        logger.info("Single-strategy graph compiled")
 
     if args.once or args.dry_run:
         logger.info("Running single cycle...")
